@@ -469,12 +469,32 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else True
         )
 
+        # A block-verify draft (DSpark, and DFlash via the same seam) can in
+        # principle propose fewer than num_tokens_per_bs draft tokens for a
+        # round (e.g. DSpark's confidence-gated dynamic verify width). The
+        # captured graph's buffers are sized for the full width, and
+        # load_batch's copy_ into those fixed-size buffers assumes
+        # raw_num_token == forward_batch.input_ids.numel(); silently
+        # replaying a narrower batch into them would copy into the wrong
+        # offsets and corrupt the graph. Force eager whenever the actual
+        # token count doesn't match the full width. With today's always-full
+        # verify width this is a no-op for both algorithms.
+        is_verify_width_supported = (
+            (
+                forward_batch.batch_size * self.num_tokens_per_bs
+                == forward_batch.input_ids.numel()
+            )
+            if self.model_runner.spec_algorithm.supports_target_verify_for_draft()
+            else True
+        )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_verify_width_supported
         )
 
     def _init_profile_context_and_memory_record(self):
