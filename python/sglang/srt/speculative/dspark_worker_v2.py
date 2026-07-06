@@ -740,6 +740,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                     block_hidden, draft_input.bonus_tokens, self._refine_refs
                 )
 
+        # Computed here (before the target verify forward, not after) so a
+        # future dynamic verify width can be derived from it; confidence is
+        # None exactly when use_confidence is False, so confident_prefix stays
+        # None in that case too.
+        confident_prefix = (
+            self._confident_prefix(confidence) if confidence is not None else None
+        )
+
         verify_input = DSparkVerifyInput(
             draft_token=candidates.reshape(-1),
             positions=positions,
@@ -767,9 +775,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_token_num=block_size,
             )
-        confident_prefix = (
-            self._confident_prefix(confidence) if confidence is not None else None
-        )
 
         if (
             sampling_info is not None
