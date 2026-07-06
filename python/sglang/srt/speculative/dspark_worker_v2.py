@@ -748,14 +748,48 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._confident_prefix(confidence) if confidence is not None else None
         )
 
+        if confident_prefix is None:
+            # Confidence gating is off: identical to today, no host sync.
+            dynamic_width = block_size
+        else:
+            # Batch-uniform dynamic verify width (phase4-preverify PLAN.md): a
+            # window of `dynamic_width` slots (anchor + dynamic_width - 1
+            # drafts) is wide enough that every row's own confident_prefix
+            # still fits inside it, so truncating the match to this window and
+            # then min()-ing with confident_prefix below is bit-identical to
+            # today's full-width-match-then-min() scheme -- see
+            # TestDSparkPreVerifyTruncationMatchesPostHoc for the CPU proof of
+            # this identity. This is the one new pre-launch host sync this
+            # feature adds; it is measured (not argued) in the P2c latency
+            # ladder before this is trusted at small batch sizes.
+            dynamic_width = min(block_size, int(confident_prefix.max().item()) + 1)
+
+        if dynamic_width == block_size:
+            # Exactly today's path: same objects, same shapes, graph-eligible.
+            verify_candidates = candidates
+            verify_positions = positions
+            verify_cache_loc = verify_out_cache_loc
+        else:
+            # Eager fallback only: the is_verify_width_supported CUDA-graph
+            # guard forces can_run_graph False whenever draft_token_num !=
+            # num_tokens_per_bs. Buffers stay allocated at block_size; these
+            # are slice views into them, not reallocations.
+            verify_candidates = candidates[:, :dynamic_width]
+            verify_positions = (
+                positions_2d[:, :dynamic_width].reshape(-1).to(torch.int64)
+            )
+            verify_cache_loc = verify_out_cache_loc.view(bs, block_size)[
+                :, :dynamic_width
+            ].reshape(-1)
+
         verify_input = DSparkVerifyInput(
-            draft_token=candidates.reshape(-1),
-            positions=positions,
-            draft_token_num=block_size,
+            draft_token=verify_candidates.reshape(-1),
+            positions=verify_positions,
+            draft_token_num=dynamic_width,
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
-        model_worker_batch.out_cache_loc = verify_out_cache_loc
+        model_worker_batch.out_cache_loc = verify_cache_loc
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             model_worker_batch, self.target_worker
         )
@@ -773,7 +807,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
-                draft_token_num=block_size,
+                draft_token_num=dynamic_width,
             )
 
         if (
@@ -789,7 +823,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             accept_len, sampled_bonus = (
                 compute_dflash_sampling_correct_drafts_and_bonus(
-                    candidates=candidates,
+                    candidates=verify_candidates,
                     next_token_logits=logits_output.next_token_logits,
                     sampling_info=sampling_info,
                     max_top_k=draft_input.max_top_k,
@@ -813,8 +847,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
                 truncated = correct_len < accept_len
                 next_draft = (
-                    candidates.gather(
-                        1, (correct_len + 1).clamp(max=block_size - 1).unsqueeze(1)
+                    verify_candidates.gather(
+                        1,
+                        (correct_len + 1).clamp(max=dynamic_width - 1).unsqueeze(1),
                     )
                     .squeeze(1)
                     .to(torch.int64)
@@ -827,14 +862,19 @@ class DSparkWorkerV2(BaseSpecWorker):
                 bonus_tokens = sampled_bonus.to(torch.int64)
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, block_size
+                bs, dynamic_width
             )
             correct_len, _ = compute_dflash_correct_drafts_and_bonus(
-                candidates=candidates,
+                candidates=verify_candidates,
                 target_predict=target_predict,
             )
             correct_len = correct_len.to(torch.int64)
             if confident_prefix is not None:
+                # Redundant whenever the window was itself sized off
+                # confident_prefix (min with something already >= itself),
+                # but kept unconditionally so this line alone stays correct
+                # even when dynamic_width == block_size (gate off, or every
+                # row's own confident_prefix already reached the full block).
                 correct_len = torch.minimum(
                     correct_len, confident_prefix.to(torch.int64)
                 )
@@ -843,10 +883,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         commit_lens.copy_(correct_len)
         commit_lens.add_(1)
 
-        if block_size > 1:
-            out_tokens[:, : block_size - 1].copy_(candidates[:, 1:])
-        out_tokens[:, block_size - 1].fill_(0)
-        out_tokens.scatter_(
+        # out_tokens stays allocated at block_size; out_window is a slice view
+        # into it (not a reallocation). Columns beyond dynamic_width are never
+        # written and never read this round: correct_len < dynamic_width
+        # always (see the CPU proof), and the reported stride matches
+        # dynamic_width (next commit).
+        out_window = out_tokens[:, :dynamic_width]
+        if dynamic_width > 1:
+            out_window[:, : dynamic_width - 1].copy_(verify_candidates[:, 1:])
+        out_window[:, dynamic_width - 1].fill_(0)
+        out_window.scatter_(
             1, correct_len.unsqueeze(1), bonus_tokens.unsqueeze(1).to(torch.int64)
         )
 
@@ -860,13 +906,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "DSpark verify requires target main_hidden states, but got None."
             )
-        # Write KV for all block positions, not just the committed prefix: uncommitted
-        # slots are never read before the next verify overwrites them.
-        hidden = hidden.view(bs, block_size, -1)
+        # Write KV for all verified positions, not just the committed prefix:
+        # uncommitted slots (rejected, or simply outside this round's window)
+        # are never read before the next round's draft pass overwrites them.
+        hidden = hidden.view(bs, dynamic_width, -1)
         self._materialize_main_hidden_to_draft_kv(
             main_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            positions=positions,
+            cache_loc=verify_cache_loc,
+            positions=verify_positions,
         )
 
         logits_output.hidden_states = None
@@ -878,10 +925,17 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=out_tokens.reshape(-1),
+            next_token_ids=out_window.reshape(-1),
             accept_lens=commit_lens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
+            # NOTE: still reports block_size, not dynamic_width, here -- see
+            # the next commit. next_token_ids above is already windowed to
+            # dynamic_width; the two must change together to keep
+            # batch_result_processor's stride math aligned, and this commit
+            # deliberately only does the first half so the diff stays
+            # reviewable in isolation. Never exercised on GPU in this
+            # half-done state: both land before any GPU run.
             speculative_num_draft_tokens=block_size,
             new_seq_lens=new_seq_lens,
         )
