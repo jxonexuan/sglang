@@ -775,7 +775,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             # this identity. This is the one new pre-launch host sync this
             # feature adds; it is measured (not argued) in the P2c latency
             # ladder before this is trusted at small batch sizes.
-            dynamic_width = min(block_size, int(confident_prefix.max().item()) + 1)
+            # Floor the verify width at 2. A width-1 TARGET_VERIFY is a
+            # degenerate 1-token extend (single query per request, zero draft
+            # tokens past the anchor) that corrupts GPU memory under
+            # concurrency (bs >= 2) -- reproduced as an illegal memory access
+            # localized to exactly the dynamic_width==1 rounds. We never need
+            # width 1: it arises only when every request's confident_prefix is
+            # 0, and there correct_len = min(match, 0) = 0 regardless of the
+            # verify width, so committing the single bonus token is
+            # bit-identical whether we verified 1 or 2 positions. Flooring at 2
+            # therefore preserves the exact lossless/parity property (proven in
+            # TestDSparkPreVerifyTruncationMatchesPostHoc, which covers cp==0
+            # rows) and costs at most one extra verified-then-discarded token
+            # on the rare all-zero-confidence round.
+            dynamic_width = min(
+                block_size, max(2, int(confident_prefix.max().item()) + 1)
+            )
 
         if dynamic_width == block_size:
             # Exactly today's path: same objects, same shapes, graph-eligible.
@@ -785,9 +800,18 @@ class DSparkWorkerV2(BaseSpecWorker):
         else:
             # Eager fallback only: the is_verify_width_supported CUDA-graph
             # guard forces can_run_graph False whenever draft_token_num !=
-            # num_tokens_per_bs. Buffers stay allocated at block_size; these
-            # are slice views into them, not reallocations.
-            verify_candidates = candidates[:, :dynamic_width]
+            # num_tokens_per_bs. NOTE: a [:, :dynamic_width] slice of a
+            # block_size-strided buffer is non-contiguous at bs > 1, so these
+            # .contiguous()/.reshape(-1) calls each allocate a FRESH tensor
+            # (not a view). They are (a) made contiguous so the verify sampling
+            # kernel's row-stride==dynamic_width pointer math is correct, and
+            # (b) added to extra_keep_alive_refs on the returned result so the
+            # scheduler pins them across the 2-iter cross-stream window -- the
+            # same lifetime protection every EAGLE-family v2 worker applies to
+            # its prepare_for_verify tensors. Without (b) the allocator can
+            # recycle them while the target-verify / draft-KV kernels are still
+            # reading on another stream (illegal memory access at bs >= 2).
+            verify_candidates = candidates[:, :dynamic_width].contiguous()
             verify_positions = (
                 positions_2d[:, :dynamic_width].reshape(-1).to(torch.int64)
             )
@@ -963,6 +987,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             # block_size), so the reported stride has to match.
             speculative_num_draft_tokens=dynamic_width,
             new_seq_lens=new_seq_lens,
+            # Pin the per-round verify tensors (fresh allocations on a
+            # truncated round) across the scheduler's 2-iter window so the
+            # allocator cannot recycle them while the target-verify or
+            # draft-KV materialize kernels are still reading on another
+            # stream. verify_forward_batch transitively holds draft_token /
+            # out_cache_loc; mirrors eagle_worker_v2's extra_keep_alive_refs.
+            extra_keep_alive_refs=[
+                verify_forward_batch,
+                verify_candidates,
+                verify_positions,
+                verify_cache_loc,
+            ],
         )
 
     def _forward_idle(self, on_publish) -> GenerationBatchResult:
