@@ -280,6 +280,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._decode_buffer_slot = 0
         self._block_ids_bufs = []
         self._out_tokens_bufs = []
+        self._out_ids_flat_bufs = []
         self._commit_lens_bufs = []
         self._new_seq_lens_bufs = []
 
@@ -539,6 +540,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             torch.empty((new_cap, block_size), dtype=torch.int64, device=device)
             for _ in range(2)
         ]
+        # Flat staging for a width-truncated round's committed ids: the result
+        # path's async D2H reads next_token_ids on a side stream after this
+        # round returns, so it must always be (a view of) a persistent,
+        # double-buffered tensor -- never a per-round temporary.
+        self._out_ids_flat_bufs = [
+            torch.empty((new_cap * block_size,), dtype=torch.int64, device=device)
+            for _ in range(2)
+        ]
         self._commit_lens_bufs = [
             torch.empty((new_cap,), dtype=torch.int32, device=device) for _ in range(2)
         ]
@@ -552,6 +561,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
     ]:
         self._ensure_decode_buffers(bs)
         slot = self._decode_buffer_slot
@@ -561,6 +571,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._out_tokens_bufs[slot][:bs],
             self._commit_lens_bufs[slot][:bs],
             self._new_seq_lens_bufs[slot][:bs],
+            self._out_ids_flat_bufs[slot],
         )
 
     def _make_next_draft_input_prefill(
@@ -697,7 +708,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         prefix_lens = model_worker_batch.seq_lens
         req_pool_indices = model_worker_batch.req_pool_indices
 
-        block_ids, out_tokens, commit_lens, new_seq_lens = self._next_decode_buffers(bs)
+        block_ids, out_tokens, commit_lens, new_seq_lens, out_ids_flat = (
+            self._next_decode_buffers(bs)
+        )
         block_ids.fill_(self.noise_token_id)
         block_ids[:, 0].copy_(draft_input.bonus_tokens.view(-1))
 
@@ -895,6 +908,21 @@ class DSparkWorkerV2(BaseSpecWorker):
         out_window.scatter_(
             1, correct_len.unsqueeze(1), bonus_tokens.unsqueeze(1).to(torch.int64)
         )
+        if dynamic_width == block_size:
+            # Contiguous view of the persistent double-buffered out_tokens --
+            # the pre-truncation behavior, byte for byte.
+            next_ids = out_tokens.reshape(-1)
+        else:
+            # Stage the windowed ids into the persistent flat buffer. The
+            # result path's async D2H reads next_token_ids on a side stream
+            # after this round returns, so it must be a view of a persistent,
+            # double-buffered tensor. out_window.reshape(-1) would materialize
+            # a per-round temporary (the window is a non-contiguous slice),
+            # which the allocator can free and hand to the next round while
+            # the copy is still in flight -- observed as a delayed illegal
+            # memory access under concurrency (bs >= 2).
+            next_ids = out_ids_flat[: bs * dynamic_width]
+            next_ids.view(bs, dynamic_width).copy_(out_window)
 
         new_seq_lens.copy_(prefix_lens)
         new_seq_lens.add_(commit_lens)
@@ -925,7 +953,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=out_window.reshape(-1),
+            next_token_ids=next_ids,
             accept_lens=commit_lens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
