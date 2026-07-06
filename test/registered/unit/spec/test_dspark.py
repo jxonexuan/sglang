@@ -547,6 +547,227 @@ class TestDSparkConfidentPrefix(_DSparkMathBase):
         self.assertEqual(self._confident_prefix(conf, self.THRESH).tolist(), [3, 0, 1])
 
 
+class TestDSparkPreVerifyTruncationMatchesPostHoc(_DSparkMathBase):
+    """P0 CPU proof for pre-verify confidence truncation (phase4-preverify/PLAN.md).
+
+    Property under test: given this round's real confidence, a batch-uniform
+    dynamic verify window
+
+        dynamic_width = block_size                            if confidence gating is off
+        dynamic_width = min(block_size, cp.max().item() + 1)  otherwise (cp = confident_prefix)
+
+    and verifying only ``candidates[:, :dynamic_width]`` against the target's
+    predictions for that same window must yield, per row, EXACTLY the same
+    correct_len and bonus token as today's post-hoc scheme (full-width match,
+    then min() with confident_prefix).
+
+    This holds because compute_dflash_correct_drafts_and_bonus's leading-match
+    run is a *prefix* quantity: matching over a w-column window returns
+    min(correct_len_full, w - 1). By construction w - 1 is always >= every
+    row's confident_prefix (either the window was shrunk to exactly
+    max_r(cp_r), so w - 1 == max_r(cp_r) >= cp_r for every r; or the window
+    is already full, in which case w - 1 == block_size - 1 >= correct_len_full
+    unconditionally, so the outer min() is a no-op regardless of cp). Either
+    way min(min(correct_len_full, w - 1), cp) == min(correct_len_full, cp).
+    """
+
+    def setUp(self):
+        super().setUp()
+        try:
+            from sglang.srt.speculative.dflash_utils import (
+                compute_dflash_correct_drafts_and_bonus,
+            )
+        except Exception as e:  # pragma: no cover - GPU-only deps on some runners
+            self.skipTest(f"dflash_utils unavailable on this runner: {e}")
+        self._compute_correct = compute_dflash_correct_drafts_and_bonus
+
+    @staticmethod
+    def _logit(p: float) -> float:
+        import math
+
+        return math.log(p / (1.0 - p))
+
+    def _make_case(self, bs, block_size, tau, match_lens, confident_lens):
+        """Build (candidates, target_predict, confidence) realizing, per row,
+        an exact raw greedy-match length (match_lens[r], in [0, block_size-1])
+        and an exact confident-prefix length (confident_lens[r], in
+        [0, block_size]) at threshold `tau`.
+        """
+        t = self.torch
+        candidates = t.zeros((bs, block_size), dtype=t.int64)
+        target_predict = t.zeros((bs, block_size), dtype=t.int64)
+        for r in range(bs):
+            m = match_lens[r]
+            for k in range(block_size - 1):
+                if k < m:
+                    # draft column k+1 matches the target's prediction at k.
+                    val = 2 * k + 1
+                    candidates[r, k + 1] = val
+                    target_predict[r, k] = val
+                else:
+                    # Guaranteed mismatch for every remaining column, so the
+                    # leading run stops at exactly m regardless of window.
+                    candidates[r, k + 1] = 1000 + 2 * k
+                    target_predict[r, k] = 2000 + 2 * k
+            target_predict[r, block_size - 1] = 5000 + r  # bonus-slot prediction
+
+        if tau <= 0.0:
+            # sigmoid(x) >= 0 always holds: confidence values are irrelevant.
+            confidence = t.zeros((bs, block_size), dtype=t.float32)
+        else:
+            logit_tau = self._logit(tau)
+            confidence = t.empty((bs, block_size), dtype=t.float32)
+            for r in range(bs):
+                c = confident_lens[r]
+                for k in range(block_size):
+                    confidence[r, k] = logit_tau + 5.0 if k < c else logit_tau - 5.0
+        return candidates, target_predict, confidence
+
+    def _post_hoc(self, candidates, target_predict, confidence, tau):
+        """Today's shipped rule: full-width match, then min() with confident_prefix."""
+        t = self.torch
+        raw_correct, _ = self._compute_correct(
+            candidates=candidates, target_predict=target_predict
+        )
+        confident_prefix = self._confident_prefix(confidence, tau)
+        correct_len = t.minimum(raw_correct.to(t.int64), confident_prefix.to(t.int64))
+        bonus_tokens = target_predict.gather(1, correct_len.unsqueeze(1)).squeeze(1)
+        return correct_len, bonus_tokens, confident_prefix
+
+    def _pre_verify(
+        self, candidates, target_predict, confidence, tau, block_size, use_confidence
+    ):
+        """MVP rule: truncate to a batch-uniform dynamic_width before matching."""
+        t = self.torch
+        confident_prefix = self._confident_prefix(confidence, tau)
+        if not use_confidence:
+            dynamic_width = block_size
+        else:
+            dynamic_width = min(block_size, int(confident_prefix.max().item()) + 1)
+        candidates_window = candidates[:, :dynamic_width]
+        target_predict_window = target_predict[:, :dynamic_width]
+        raw_correct, _ = self._compute_correct(
+            candidates=candidates_window, target_predict=target_predict_window
+        )
+        correct_len = t.minimum(raw_correct.to(t.int64), confident_prefix.to(t.int64))
+        bonus_tokens = target_predict_window.gather(
+            1, correct_len.unsqueeze(1)
+        ).squeeze(1)
+        return correct_len, bonus_tokens, dynamic_width
+
+    def _assert_case(
+        self, bs, block_size, tau, match_lens, confident_lens, use_confidence=None
+    ):
+        if use_confidence is None:
+            use_confidence = tau > 0.0
+        candidates, target_predict, confidence = self._make_case(
+            bs, block_size, tau, match_lens, confident_lens
+        )
+        post_len, post_bonus, cp = self._post_hoc(
+            candidates, target_predict, confidence, tau
+        )
+        pre_len, pre_bonus, dynamic_width = self._pre_verify(
+            candidates, target_predict, confidence, tau, block_size, use_confidence
+        )
+        ctx = (
+            f"bs={bs} block_size={block_size} tau={tau} match_lens={match_lens} "
+            f"confident_lens={confident_lens} dynamic_width={dynamic_width} "
+            f"cp={cp.tolist()}"
+        )
+        self.assertEqual(pre_len.tolist(), post_len.tolist(), f"correct_len: {ctx}")
+        self.assertEqual(pre_bonus.tolist(), post_bonus.tolist(), f"bonus: {ctx}")
+        self.assertLessEqual(dynamic_width, block_size)
+        self.assertGreaterEqual(dynamic_width, 1)
+        return dynamic_width
+
+    def test_random_property_sweep(self):
+        import random
+
+        rng = random.Random(20260706)
+        for bs in (1, 2, 4, 8):
+            for block_size in (4, 7):
+                for tau in (0.0, 0.1, 0.3, 0.5, 0.8, 0.95):
+                    for trial in range(15):
+                        match_lens = [rng.randrange(block_size) for _ in range(bs)]
+                        confident_lens = [
+                            rng.randrange(block_size + 1) for _ in range(bs)
+                        ]
+                        with self.subTest(
+                            bs=bs,
+                            block_size=block_size,
+                            tau=tau,
+                            trial=trial,
+                        ):
+                            self._assert_case(
+                                bs, block_size, tau, match_lens, confident_lens
+                            )
+
+    def test_all_below_tau_rows_are_anchor_only(self):
+        # Every row's confidence run is 0 (cp=0): the batch-uniform window
+        # collapses to dynamic_width=1 (anchor slot only, no drafts survive).
+        for block_size in (4, 7):
+            for bs in (1, 2, 4):
+                with self.subTest(block_size=block_size, bs=bs):
+                    match_lens = [block_size - 1] * bs  # would fully match if allowed
+                    confident_lens = [0] * bs
+                    dynamic_width = self._assert_case(
+                        bs, block_size, 0.5, match_lens, confident_lens
+                    )
+                    self.assertEqual(dynamic_width, 1)
+
+    def test_all_above_tau_rows_take_full_block(self):
+        # Every row's confidence run is the full block (cp=block_size): the
+        # window must not shrink at all.
+        for block_size in (4, 7):
+            for bs in (1, 2, 4):
+                with self.subTest(block_size=block_size, bs=bs):
+                    match_lens = [block_size - 1] * bs
+                    confident_lens = [block_size] * bs
+                    dynamic_width = self._assert_case(
+                        bs, block_size, 0.5, match_lens, confident_lens
+                    )
+                    self.assertEqual(dynamic_width, block_size)
+
+    def test_mixed_batch_one_row_drives_the_window(self):
+        # Batch-uniform width is driven by max_r(cp_r): one confident row
+        # keeps the window full even though the rest are not confident.
+        block_size = 7
+        match_lens = [block_size - 1] * 4
+        confident_lens = [block_size, 1, 2, 0]
+        dynamic_width = self._assert_case(
+            4, block_size, 0.5, match_lens, confident_lens
+        )
+        self.assertEqual(dynamic_width, block_size)  # driven by row 0 (cp=block_size)
+
+        # Drop row 0's confidence: the max is now row 2 (cp=2), so the window
+        # shrinks to 3 for the whole batch, and every row must still resolve
+        # to the same correct_len/bonus as the post-hoc reference.
+        confident_lens2 = [1, 1, 2, 0]
+        dynamic_width2 = self._assert_case(
+            4, block_size, 0.5, match_lens, confident_lens2
+        )
+        self.assertEqual(dynamic_width2, 3)
+
+    def test_tau_zero_gate_off_dynamic_width_is_block_size(self):
+        # tau<=0 means confidence gating is off entirely (use_confidence=False
+        # in the worker): dynamic_width is trivially block_size, same code
+        # path as today, no .item() sync.
+        for block_size in (4, 7):
+            for bs in (1, 4):
+                with self.subTest(block_size=block_size, bs=bs):
+                    match_lens = [block_size - 1] + [0] * (bs - 1)
+                    confident_lens = [0] * bs  # irrelevant at tau=0
+                    dynamic_width = self._assert_case(
+                        bs,
+                        block_size,
+                        0.0,
+                        match_lens,
+                        confident_lens,
+                        use_confidence=False,
+                    )
+                    self.assertEqual(dynamic_width, block_size)
+
+
 class TestDSparkShardArgmaxPack(_DSparkMathBase):
     """Exactness of the shard-local argmax packing used by the collective-free
     Markov refine: pack (bf16 value, global index) into one int64 whose MAX
