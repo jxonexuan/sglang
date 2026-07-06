@@ -929,14 +929,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             accept_lens=commit_lens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
-            # NOTE: still reports block_size, not dynamic_width, here -- see
-            # the next commit. next_token_ids above is already windowed to
-            # dynamic_width; the two must change together to keep
-            # batch_result_processor's stride math aligned, and this commit
-            # deliberately only does the first half so the diff stays
-            # reviewable in isolation. Never exercised on GPU in this
-            # half-done state: both land before any GPU run.
-            speculative_num_draft_tokens=block_size,
+            # Actual width verified this round, not the configured ceiling:
+            # next_token_ids above is already strided at dynamic_width (an
+            # out_window view, block_size wide only when dynamic_width ==
+            # block_size), so the reported stride has to match.
+            speculative_num_draft_tokens=dynamic_width,
             new_seq_lens=new_seq_lens,
         )
 
