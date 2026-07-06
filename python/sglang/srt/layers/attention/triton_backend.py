@@ -775,10 +775,23 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = None
         elif forward_batch.forward_mode.is_target_verify():
             bs = len(forward_batch.req_pool_indices)
+            # The verify width can be narrower than the configured ceiling for
+            # a given round (DSpark's pre-verify confidence truncation), so it
+            # must come from this round's spec_info rather than the
+            # backend-cached constant. For EAGLE/DFLASH/NGRAM the per-round
+            # draft_token_num always equals the configured value, so this is
+            # behavior-preserving for them. (flashinfer's verify path already
+            # reads the per-call value via spec_info.generate_attn_arg_prefill;
+            # this branch was the only verify consumer of the cached constant.)
+            draft_token_num = (
+                spec_info.draft_token_num
+                if hasattr(spec_info, "draft_token_num")
+                else self.num_draft_tokens
+            )
             qo_indptr = torch.arange(
                 0,
-                (1 + bs) * self.num_draft_tokens,
-                step=self.num_draft_tokens,
+                (1 + bs) * draft_token_num,
+                step=draft_token_num,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -815,13 +828,11 @@ class TritonAttnBackend(AttentionBackend):
                 )
 
             custom_mask = spec_info.custom_mask
-            seq_mask_len = self.num_draft_tokens * (
-                forward_batch.seq_lens + self.num_draft_tokens
-            )
+            seq_mask_len = draft_token_num * (forward_batch.seq_lens + draft_token_num)
             mask_indptr = self.mask_indptr
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
             mask_indptr = mask_indptr[: bs + 1]
-            max_extend_len = self.num_draft_tokens
+            max_extend_len = draft_token_num
             num_kv_splits = None
             attn_logits = None
             attn_lse = None
